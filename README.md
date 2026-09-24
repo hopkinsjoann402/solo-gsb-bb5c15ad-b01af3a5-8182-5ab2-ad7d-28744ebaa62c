@@ -13,7 +13,10 @@
 （后代先加工、每轮贪心选取距刀头最近的细分顶点入刀，输出加工顺序与逐段空走距离）、
 **`POST /paths/{id}/tabs` 外环微桥布置**
 （沿细分折线建立首尾相接的弧长坐标，按周长等分扇区就近放置带拐角余量、
-互不重叠的微桥，输出桥段起终点/中心坐标与弧长并报告未能放置的数量）
+互不重叠的微桥，输出桥段起终点/中心坐标与弧长并报告未能放置的数量）、
+**`POST /paths/{id}/intersections` 闭合轮廓交叉检查**
+（加工前只读检查细分折线：闭合子路径非相邻边自交与不同闭合子路径边相交，
+按交叉/端点接触/共线重叠三类报告交点坐标与涉及边索引，同坐标同类型合并）
 与 **`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
@@ -32,8 +35,9 @@
 │   ├── clearance.py   # 轮廓间安全间隙校验：逐段最小欧氏距离、孔-直接 parent 标记
 │   ├── cutplan.py     # 闭合轮廓加工计划：后代先加工 + 最近入刀点贪心、逐段空走距离
 │   ├── tabs.py        # 外环微桥布置：周长等分扇区、拐角余量/互不重叠约束、逐桥段坐标与弧长
+│   ├── intersections.py # 闭合轮廓交叉检查：非相邻边自交 + 轮廓间相交，三类交点合并与稳定排序
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（184 个）
+├── tests/             # pytest 单元 + API 端到端测试（212 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -521,6 +525,87 @@ curl -s -X POST localhost:8000/paths/1/tabs \
 #    则 tab_count=0、unplaced_count=2
 ```
 
+### `POST /paths/{id}/intersections` — 闭合轮廓交叉检查（只读）
+
+对已存路径**即时解析**并完成轮廓包含层级分类（无需事先调用 normalize，
+**不写数据库**），复用与 metrics / clearance 相同的曲线细分折线，在
+**加工前**检查闭合轮廓的边相交情况并输出交叉清单：
+
+- **自交**：同一闭合子路径内所有**非相邻**边对逐一检查——相邻边
+  （含末边与首边）仅共享端点属于正常，不产生条目；
+- **轮廓间相交**：不同闭合子路径的所有边对逐一检查；
+- 相交类型（`type`）：
+    - `cross`：交叉，交点严格位于两条边的内部；
+    - `touch`：端点接触，单点相交且交点至少是一条边的端点；
+    - `overlap`：共线重叠，两边共线且重叠区间长度为正，
+      以 `start` / `end` 给出重叠区间的两个端点；
+- **合并**：坐标相同（量化到 1e-9）且类型相同的交点合并为一条，
+  其涉及的 `(contour, edge)` 边索引取并集；
+- **排序**：`intersections[]` 按涉及边的 `(contour, edge)` 索引升序、
+  再按类型稳定排列，多次调用结果一致；
+- **参与规则**：仅闭合且非退化轮廓（`outer` / `hole`）参与；开放与
+  退化轮廓跳过并列入 `skipped_contours`；空路径返回空清单。
+
+无请求体。
+
+```bash
+# 五边形自交：边 0 (0,0)-(10,10) 与边 2 (10,0)-(0,10) 在 (5,5) 交叉
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0 L10,10 L10,0 L0,10 L-5,5 Z"
+}'
+curl -s -X POST localhost:8000/paths/1/intersections
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "checked_contour_count": 1,
+  "skipped_contours": [],
+  "intersection_count": 1,
+  "intersections": [
+    {
+      "type": "cross",
+      "point": {"x": 5.0, "y": 5.0},
+      "edges": [
+        {"contour": 0, "edge": 0},
+        {"contour": 0, "edge": 2}
+      ]
+    }
+  ]
+}
+```
+
+- `edges[]`：涉及边的**轮廓原始索引**（`contour`）与**边索引**
+  （`edge`，边 `k` 为细分顶点 `k` 到 `k+1`，末边回首点），按索引升序；
+  全部 `contour` 相同即为自交，否则为轮廓间相交；
+- `point`：`cross` / `touch` 的交点坐标；`overlap` 改给 `start` / `end`
+  两个端点（按坐标字典序排列）；
+- 合并示例：两个正方形仅共享角点 `(10,10)` 时，4 个边对在同一点
+  端点接触，合并为一条 `touch`，`edges` 含 4 条边；
+- `skipped_contours[]`：跳过的轮廓及 `reason`（`open` / `degenerate`）；
+- 路径不存在返回 `404`，已存路径无法解析（历史脏数据）返回 `422`。
+
+共线重叠与轮廓间交叉的示例（两矩形在 `y=0` 上重叠 `(5,0)-(10,0)`，
+重叠端点同时引发两条端点接触；错位正方形产生两处 `cross`）：
+
+```bash
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0 L10,0 L10,5 L0,5 Z M5,0 L15,0 L15,-5 L5,-5 Z"
+}'
+curl -s -X POST localhost:8000/paths/1/intersections
+# -> intersections[0]: {"type":"overlap","start":{"x":5.0,"y":0.0},
+#    "end":{"x":10.0,"y":0.0},"edges":[{"contour":0,"edge":0},{"contour":1,"edge":0}]}
+
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h10v10h-10Z M5,5h10v10h-10Z"
+}'
+curl -s -X POST localhost:8000/paths/1/intersections
+# -> 两处 cross：(10,5) 边对 (0,1)-(1,0)，(5,10) 边对 (0,2)-(1,3)
+```
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -666,7 +751,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 184 passed
+pytest -q          # 212 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -694,7 +779,11 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 桥段不跨顶点余量区且互不重叠（相切允许、超限拥挤时报告未放置数）、
 边太短/余量过大/桥宽超过周长整轮廓无法放置、仅闭合非退化 outer 参与
 （跳过 hole/open/degenerate、孔中岛深度 2 仍处理）、曲线细分折线、
-默认余量 0、确定性与两种填充规则一致、只读不落库、404/非法参数 422 等。
+默认余量 0、确定性与两种填充规则一致、只读不落库、404/非法参数 422 等；
+闭合轮廓交叉检查的非相邻边自交单点交叉、顶点落边的同坐标同类型合并、
+相邻边（含首尾边）共享端点不报告、轮廓间交叉/角点接触合并/共线重叠两端点、
+全等轮廓逐边重叠、开放与退化跳过、空路径空清单、曲线细分后求交、
+两种填充规则一致、结果确定性与只读不落库、404/脏数据 422 等。
 
 ## 数据存储
 
