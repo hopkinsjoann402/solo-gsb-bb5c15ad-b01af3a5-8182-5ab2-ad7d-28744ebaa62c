@@ -13,7 +13,10 @@
 （后代先加工、每轮贪心选取距刀头最近的细分顶点入刀，输出加工顺序与逐段空走距离）、
 **`POST /paths/{id}/tabs` 外环微桥布置**
 （沿细分折线建立首尾相接的弧长坐标，按周长等分扇区就近放置带拐角余量、
-互不重叠的微桥，输出桥段起终点/中心坐标与弧长并报告未能放置的数量）
+互不重叠的微桥，输出桥段起终点/中心坐标与弧长并报告未能放置的数量）、
+**`POST /paths/{id}/intersections` 加工前轮廓交叉清单**
+（只读检查细分折线的自交与子路径互交，报告交叉 / 端点接触 / 共线重叠
+的类型、交点坐标及原始轮廓与边索引）
 与 **`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
@@ -32,8 +35,9 @@
 │   ├── clearance.py   # 轮廓间安全间隙校验：逐段最小欧氏距离、孔-直接 parent 标记
 │   ├── cutplan.py     # 闭合轮廓加工计划：后代先加工 + 最近入刀点贪心、逐段空走距离
 │   ├── tabs.py        # 外环微桥布置：周长等分扇区、拐角余量/互不重叠约束、逐桥段坐标与弧长
+│   ├── intersections.py # 加工前轮廓交叉清单：非相邻边自交/子路径互交、交叉/接触/共线重叠分类合并
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（184 个）
+├── tests/             # pytest 单元 + API 端到端测试（222 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -521,6 +525,76 @@ curl -s -X POST localhost:8000/paths/1/tabs \
 #    则 tab_count=0、unplaced_count=2
 ```
 
+### `POST /paths/{id}/intersections` — 加工前轮廓交叉清单（只读）
+
+对已存路径**即时解析**（复用与 metrics / clearance / cut-plan / tabs 相同的
+曲线细分折线，无需事先调用 normalize，**不写数据库**），在**加工前**对每条
+**闭合子路径**检查边相交，并汇总成稳定排序的交叉清单：
+
+- **环内自交**：检查同一闭合环上所有**非相邻边**对；相邻边仅共享端点，
+  属正常拐角连接，不报告（闭合环包含末点回首点的闭合边）；
+- **环间互交**：检查不同闭合子路径之间的全部边对；
+- **开放轮廓**（未以 `Z` 闭合）不参与，列入 `skipped_contours`；
+  闭合但退化的子路径（面积为 0 或顶点不足）仍按字面参与边检查；
+- 每条交点报告三类 `type` 之一：
+  - `crossing`：两线段在**内部**真正交叉；
+  - `endpoint_contact`：**端点接触**——某条边的端点落在另一条边上
+    （含环内非相邻边共享端点的“收尖/捏合”、T 型接触与角点相触）；
+  - `collinear_overlap`：两共线边共享一段**非零长度**区间（仅相触于
+    一点归为 `endpoint_contact`）；
+- `crossing` / `endpoint_contact` 给出 `point: {x, y}`；
+  `collinear_overlap` 给出区间两端 `points: [{x,y},{x,y}]`（按坐标排序）；
+- **同坐标、同类型**的交点合并为一条，其涉及的全部
+  `(轮廓 original_index, 边索引)` 汇总到该条目的 `contours[]`
+  （每项含 `role` 与升序的 `edge_indices`；边 k 指细分顶点
+  `points[k] → points[(k+1) mod n]`）；结果按涉及的轮廓/边索引稳定排序。
+
+无请求体。路径不存在返回 `404`；已存路径无法解析（历史脏数据）返回 `422`。
+
+```bash
+# 蝴蝶结形闭合子路径：边 0 与边 2 在 (5,5) 自交
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0 L10,10 L10,0 L0,10 Z"
+}'
+curl -s -X POST localhost:8000/paths/1/intersections
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "checked_contour_count": 1,
+  "intersection_count": 1,
+  "intersections": [
+    {"type": "crossing", "point": {"x": 5.0, "y": 5.0},
+     "contours": [
+       {"original_index": 0, "role": "degenerate", "edge_indices": [0, 2]}
+     ]}
+  ],
+  "skipped_contours": []
+}
+```
+
+共线重叠同时报告重叠区间（给两端）与两端的端点接触，例如外方
+`M0,0h10v10h-10Z` 与轮廓 `M2,-10 L8,-10 L8,0 L2,0 Z` 在底边
+`(2,0)→(8,0)` 共线重叠：
+
+```json
+{
+  "type": "collinear_overlap",
+  "points": [{"x": 2.0, "y": 0.0}, {"x": 8.0, "y": 0.0}],
+  "contours": [
+    {"original_index": 0, "role": "outer", "edge_indices": [0]},
+    {"original_index": 1, "role": "outer", "edge_indices": [2]}
+  ]
+}
+```
+
+干净的轮廓（如外方 + 不接触的内孔）与空路径返回空清单
+（`intersection_count` 为 `0`、`intersections` 为 `[]`）。
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -666,7 +740,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 184 passed
+pytest -q          # 222 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -694,7 +768,13 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 桥段不跨顶点余量区且互不重叠（相切允许、超限拥挤时报告未放置数）、
 边太短/余量过大/桥宽超过周长整轮廓无法放置、仅闭合非退化 outer 参与
 （跳过 hole/open/degenerate、孔中岛深度 2 仍处理）、曲线细分折线、
-默认余量 0、确定性与两种填充规则一致、只读不落库、404/非法参数 422 等。
+默认余量 0、确定性与两种填充规则一致、只读不落库、404/非法参数 422 等；
+加工前轮廓交叉清单的简单/凹/嵌套无交叉、蝴蝶结非相邻边自交、相邻边共享
+端点不报、非相邻边共享顶点与顶点压边（收尖/T 型）端点接触、环内共线重叠
+（区间两端与重叠并存）、不同子路径交叉/角点接触/T 接触/共线重叠、
+三轮廓同点同类型合并边索引、开放轮廓跳过且不与闭合轮廓比较、闭合退化轮廓
+仍参与、单点闭合、贝塞尔/弧细分后求交、按轮廓与边索引稳定排序、跨调用
+确定性、两种填充规则一致、空路径空清单、只读不落库、404/非法 id/脏数据 422 等。
 
 ## 数据存储
 

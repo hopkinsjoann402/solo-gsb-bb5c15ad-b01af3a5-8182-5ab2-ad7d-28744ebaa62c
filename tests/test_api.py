@@ -939,3 +939,149 @@ def test_tabs_422_on_unparseable_stored_path(client):
     assert r.status_code == 422
     assert "无法解析" in r.json()["detail"]
 
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/intersections 加工前轮廓交叉清单（只读）
+# ---------------------------------------------------------------------------
+
+def test_intersections_clean_path_empty(client):
+    pid = _mk(client, "M0,0h40v40h-40Z M10,10h20v20h-20Z")
+    r = client.post(f"/paths/{pid}/intersections")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["fill_rule"] == "nonzero"
+    assert body["checked_contour_count"] == 2
+    assert body["intersection_count"] == 0
+    assert body["intersections"] == []
+    assert body["skipped_contours"] == []
+
+
+def test_intersections_empty_path(client):
+    pid = _mk(client, "")
+    r = client.post(f"/paths/{pid}/intersections")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["intersections"] == []
+    assert body["intersection_count"] == 0
+    assert body["checked_contour_count"] == 0
+
+
+def test_intersections_self_crossing(client):
+    # 蝴蝶结：边 0 与边 2 在 (5,5) 自交
+    pid = _mk(client, "M0,0 L10,10 L10,0 L0,10 Z")
+    body = client.post(f"/paths/{pid}/intersections").json()
+    assert body["intersection_count"] == 1
+    item = body["intersections"][0]
+    assert item["type"] == "crossing"
+    assert item["point"] == {"x": 5.0, "y": 5.0}
+    assert item["contours"] == [
+        {"original_index": 0, "role": "degenerate", "edge_indices": [0, 2]}]
+
+
+def test_intersections_endpoint_contact_and_edge_indices(client):
+    # 两个轮廓仅共享角点 (10,0)：端点接触，合并两侧边索引
+    pid = _mk(client, "M0,0h10v10h-10Z M10,0 L20,0 L20,10 Z")
+    body = client.post(f"/paths/{pid}/intersections").json()
+    assert body["intersection_count"] == 1
+    item = body["intersections"][0]
+    assert item["type"] == "endpoint_contact"
+    assert item["point"] == {"x": 10.0, "y": 0.0}
+    assert item["contours"][0]["original_index"] == 0
+    assert item["contours"][0]["edge_indices"] == [0, 1]
+    assert item["contours"][1]["original_index"] == 1
+    assert item["contours"][1]["edge_indices"] == [0, 2]
+
+
+def test_intersections_collinear_overlap_gives_both_ends(client):
+    # 第二轮廓顶边 (2,0)->(8,0) 与第一轮廓底边共线重叠
+    pid = _mk(client, "M0,0h10v10h-10Z M2,-10 L8,-10 L8,0 L2,0 Z")
+    body = client.post(f"/paths/{pid}/intersections").json()
+    overlaps = [i for i in body["intersections"]
+                if i["type"] == "collinear_overlap"]
+    assert len(overlaps) == 1
+    o = overlaps[0]
+    assert o["points"] == [{"x": 2.0, "y": 0.0}, {"x": 8.0, "y": 0.0}]
+    assert [g["original_index"] for g in o["contours"]] == [0, 1]
+    # 重叠两端同时报告端点接触
+    contacts = {(i["point"]["x"], i["point"]["y"])
+                for i in body["intersections"]
+                if i["type"] == "endpoint_contact"}
+    assert contacts == {(2.0, 0.0), (8.0, 0.0)}
+
+
+def test_intersections_same_point_merges_across_three_contours(client):
+    pid = _mk(client,
+              "M0,0h10v10h-10Z M10,0h10v10h-10Z M5,-5 L10,-5 L10,0 Z")
+    body = client.post(f"/paths/{pid}/intersections").json()
+    shared = [i for i in body["intersections"]
+              if i["type"] == "endpoint_contact"
+              and i["point"] == {"x": 10.0, "y": 0.0}]
+    assert len(shared) == 1  # 同坐标同类型只出一条
+    assert [g["original_index"] for g in shared[0]["contours"]] == [0, 1, 2]
+
+
+def test_intersections_adjacent_edges_not_reported(client):
+    pid = _mk(client, "M0,0 L10,0 L10,10 L0,10 Z")
+    body = client.post(f"/paths/{pid}/intersections").json()
+    assert body["intersections"] == []
+
+
+def test_intersections_open_skipped(client):
+    # 非退化开放折线穿过方块，仍不参与检查
+    pid = _mk(client, "M0,0h10v10h-10Z M-5,5 L15,5 L15,6")
+    body = client.post(f"/paths/{pid}/intersections").json()
+    assert body["checked_contour_count"] == 1
+    assert body["intersection_count"] == 0
+    assert body["skipped_contours"] == [
+        {"original_index": 1, "role": "open", "reason": "open"}]
+
+
+def test_intersections_closed_degenerate_checked(client):
+    pid = _mk(client, "M0,0 L10,0 L0,0 Z M5,0 L15,0 L15,10 Z")
+    body = client.post(f"/paths/{pid}/intersections").json()
+    assert body["checked_contour_count"] == 2
+    assert body["skipped_contours"] == []
+    assert body["intersection_count"] >= 1
+
+
+def test_intersections_sorted_stably(client):
+    d = ("M0,0 L0,10 L10,10 L10,0 Z M-5,2 L15,2 L15,8 L-5,8 Z")
+    pid = _mk(client, d)
+    bodies = [client.post(f"/paths/{pid}/intersections").json()
+              for _ in range(3)]
+    assert bodies[0] == bodies[1] == bodies[2]
+    crossings = [(i["point"]["x"], i["point"]["y"])
+                 for i in bodies[0]["intersections"] if i["type"] == "crossing"]
+    assert crossings == [(0.0, 2.0), (0.0, 8.0), (10.0, 2.0), (10.0, 8.0)]
+
+
+def test_intersections_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0 L10,10 L10,0 L0,10 Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    assert client.post(f"/paths/{pid}/intersections").status_code == 200
+    # 即时检查不写库
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+
+
+def test_intersections_404(client):
+    assert client.post("/paths/999999/intersections").status_code == 404
+
+
+def test_intersections_id_path_validation(client):
+    assert client.post("/paths/x/intersections").status_code == 422
+    assert client.post("/paths/0/intersections").status_code == 404
+
+
+def test_intersections_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/intersections")
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+
